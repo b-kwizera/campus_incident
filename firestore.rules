@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn()  { return request.auth != null; }
+    function verified()  { return signedIn() && request.auth.token.email_verified == true; }
+    function aluEmail()  {
+      return request.auth.token.email.matches('.*@alustudent[.]com')
+          || request.auth.token.email.matches('.*@alueducation[.]com');
+    }
+    function userDoc()   { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function isStaff()   { return verified() && aluEmail() && userDoc().role == 'staff'; }
+
+    // ---- users ----
+    match /users/{uid} {
+      // A user can read their own profile; staff can read any profile.
+      allow read: if signedIn() && (request.auth.uid == uid || isStaff());
+      // Self-registration: always a student, uid must match, ALU email only.
+      allow create: if signedIn() && request.auth.uid == uid && aluEmail()
+                    && request.resource.data.role == 'student';
+      // Users may edit their profile but can NEVER change role or email.
+      allow update: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.role == resource.data.role
+                    && request.resource.data.email == resource.data.email;
+      allow delete: if false;
+    }
+
+    // ---- incidents ----
+    match /incidents/{id} {
+      allow read: if verified() && aluEmail()
+                  && (resource.data.reporterId == request.auth.uid || isStaff());
+
+      // Students create their own reports, always starting as "submitted".
+      allow create: if verified() && aluEmail()
+                    && request.resource.data.reporterId == request.auth.uid
+                    && request.resource.data.status == 'submitted'
+                    && request.resource.data.title is string
+                    && request.resource.data.title.size() > 0
+                    && request.resource.data.title.size() <= 80
+                    && request.resource.data.category in
+                       ['facilities','water','electricity','safety','sanitation'];
+
+      allow update: if verified() && aluEmail() && (
+        // Reporter edits content only while still "submitted"; status/history/owner locked.
+        ( resource.data.reporterId == request.auth.uid
+          && resource.data.status == 'submitted'
+          && request.resource.data.status == resource.data.status
+          && request.resource.data.reporterId == resource.data.reporterId
+          && request.resource.data.statusHistory == resource.data.statusHistory )
+        ||
+        // Staff may only change status, history and timestamp.
+        ( isStaff()
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['status','statusHistory','updatedAt'])
+          && request.resource.data.status in ['submitted','in_progress','resolved'] )
+      );
+
+      allow delete: if verified() && aluEmail()
+                    && resource.data.reporterId == request.auth.uid
+                    && resource.data.status == 'submitted';
+    }
+  }
+}
